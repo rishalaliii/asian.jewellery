@@ -710,7 +710,7 @@ def save_product(pid,b):
             if pid:
                 db.execute('UPDATE products SET sku=?,name=?,category=?,product_type=?,metal=?,purity=?,weight_g=?,making_per_g=?,stone_charge=?,price_mode=?,fixed_price=?,stock=?,image_path=?,description=?,features=?,active=?,updated=? WHERE id=?',vals+(pid,))
             else:
-                db.execute('INSERT INTO products(sku,name,category,product_type,metal,purity,weight_g,making_per_g,stone_charge,price_mode,fixed_price,stock,image_path,description,features,active,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',vals+(ts,))
+                cur=db.execute('INSERT INTO products(sku,name,category,product_type,metal,purity,weight_g,making_per_g,stone_charge,price_mode,fixed_price,stock,image_path,description,features,active,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',vals+(ts,))
                 pid=cur.lastrowid if USE_POSTGRES else db.execute('SELECT last_insert_rowid()').fetchone()[0]
     except INTEGRITY_ERRORS: return jsonify(error='That SKU already exists.'),409
     log_activity('admin',None,'product_saved',f'Product #{pid} {sku}; active={active}; type={typ}')
