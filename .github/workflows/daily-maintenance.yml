@@ -1,0 +1,30 @@
+name: Asian Jewellery daily rates and backup
+on:
+  schedule:
+    - cron: '15 4 * * *' # 09:45 India time; GitHub may delay scheduled jobs.
+  workflow_dispatch:
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Refresh gold and silver rates
+        run: python daily_rates_job.py
+      - name: Create operational backup
+        if: ${{ always() && env.DATABASE_URL != '' }}
+        run: python backup_db.py
+      - name: Store backup artifact for 30 days
+        if: ${{ always() && env.DATABASE_URL != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: asian-jewellery-backup-${{ github.run_id }}
+          path: backups/*.json
+          retention-days: 30
+          if-no-files-found: error

@@ -67,3 +67,25 @@ The two accounts are seeded into the `admin_accounts` table once on first startu
 ### Single-device admin login (v35)
 
 Each administrator username can have only one active login session at a time. If the same username is already signed in elsewhere, another login attempt returns: `Admin already login on another device. Please log out from that device and try again.` Logging out releases that username's session. A session lease expires after 24 hours without an authenticated request; active admin requests extend it. The two different admin usernames may still be used independently.
+
+
+## Durable free-tier deployment (PostgreSQL)
+
+The default local database is SQLite (`data.db`). A free Render web service's local filesystem is ephemeral, so do not use that default for customer records in production. To use a durable external PostgreSQL database, set `DATABASE_URL` to a PostgreSQL connection string in Render. This project uses `DATABASE_URL` automatically when it begins with `postgres://` or `postgresql://`; otherwise it uses `DB_FILE`/`data.db`. Add `DATABASE_URL` as a GitHub Actions repository secret too if you want scheduled rate refreshes and backups. Keep the repository private because backups contain customer information.
+
+### Setup checklist
+
+1. Create a free PostgreSQL project with a provider such as Neon and copy its PostgreSQL connection string. Free-tier limits and availability are controlled by the provider and can change.
+2. In Render → your web service → Environment, set `DATABASE_URL` to that connection string. Keep `APP_ENV=production`, `ADMIN_USER`, `ADMIN_PASS`, and `SESSION_SECRET` configured with unique private values.
+3. In GitHub → repository Settings → Secrets and variables → Actions, add a repository secret named `DATABASE_URL` with the same connection string. Keep the GitHub repository private.
+4. Push the updated code to `main`. Render should redeploy. Test customer registration, product creation, ordering, billing, and a redeploy before accepting real orders.
+5. The `.github/workflows/daily-maintenance.yml` workflow attempts a daily rate refresh and creates a JSON backup artifact. GitHub scheduled workflows may run late; backup artifacts are retained for 30 days. Download important backups regularly and keep an independent copy.
+6. If you have a local `data.db` that contains records you want to keep, make a copy and use `migrate_sqlite_to_postgres.py` before switching live traffic. It requires `DATABASE_URL`, `DB_FILE` pointing to the old database, and valid production `ADMIN_USER`, `ADMIN_PASS`, and `SESSION_SECRET` values. Do not expect it to recover records already lost from Render's temporary filesystem.
+
+### Backups
+
+An authenticated administrator can download a JSON operational backup from `/api/admin/backup`. It excludes administrator sessions and private authentication settings. The scheduled GitHub workflow also uploads a backup artifact for 30 days. Backups contain private customer data: do not make this repository public and do not publish backup files.
+
+### Product images
+
+When PostgreSQL is enabled, newly uploaded product images are stored as data URLs inside the product record so they survive Render redeploys. Older image files stored only in `public/uploads` need to be copied/migrated separately if you still have them.

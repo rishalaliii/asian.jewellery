@@ -1,5 +1,6 @@
 import rates_sync
 import os, json, sqlite3, secrets, hashlib, hmac, time, threading
+from db_compat import connect as db_connect, USE_POSTGRES, INTEGRITY_ERRORS, DB_ERRORS, DATABASE_URL
 from datetime import datetime, timezone, date
 from functools import wraps
 from pathlib import Path
@@ -19,6 +20,7 @@ def load_env(path=ROOT/'.env'):
             os.environ.setdefault(k,v)
 load_env()
 DB_PATH = Path(os.environ.get('DB_FILE', str(ROOT / 'data.db')))
+DB_TARGET = DATABASE_URL if USE_POSTGRES else str(DB_PATH)
 app=Flask(__name__, static_folder=None)
 app.secret_key=os.environ.get('SESSION_SECRET') or secrets.token_hex(32)
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict', PERMANENT_SESSION_LIFETIME=86400, MAX_CONTENT_LENGTH=6 * 1024 * 1024)
@@ -54,13 +56,14 @@ def _auth_succeeded(ip):
 P={'gold':['916','999','995','750','585'],'silver':['999','925','800']}
 _rate_refresh_lock=threading.Lock()
 def _background_rate_refresh():
-    try: rates_sync.run_sync(str(DB_PATH), 'visitor_open')
+    try: rates_sync.run_sync(DB_TARGET, 'visitor_open')
     except Exception as e: app.logger.warning('Automatic visitor rate refresh failed: %s', e)
     finally: _rate_refresh_lock.release()
 def conn():
-    c=sqlite3.connect(DB_PATH, timeout=15); c.row_factory=sqlite3.Row; return c
+    if not USE_POSTGRES: DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return db_connect(DB_TARGET if USE_POSTGRES else str(DB_PATH), timeout=15)
 def init_db():
-    DB_PATH.parent.mkdir(parents=True,exist_ok=True)
+    if not USE_POSTGRES: DB_PATH.parent.mkdir(parents=True,exist_ok=True)
     with conn() as db:
         db.executescript('''CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v TEXT);
         CREATE TABLE IF NOT EXISTS admin_accounts(username TEXT PRIMARY KEY,password_hash TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,created TEXT NOT NULL,updated TEXT NOT NULL);
@@ -279,7 +282,7 @@ def customer_register():
     try:
         with conn() as db:
             cur=db.execute('INSERT INTO customers(name,email,phone,password_hash,created,active) VALUES(?,?,?,?,?,1)',(name,email,phone,generate_password_hash(password),now())); cid=cur.lastrowid
-    except sqlite3.IntegrityError:
+    except INTEGRITY_ERRORS:
         return jsonify(error='An account with that email or phone number already exists. Please log in.'),409
     log_activity('customer',cid,'account_registered',f'New account: {email}')
     session.clear(); session['customer_id']=cid; session.permanent=True
@@ -385,7 +388,7 @@ def admin_update_customer(cid):
     if len(name)<2 or '@' not in email or len(phone)<8: return jsonify(error='Enter a valid name, email and phone number.'),400
     try:
         with conn() as db: db.execute('UPDATE customers SET name=?,email=?,phone=?,active=? WHERE id=?',(name,email,phone,active,cid))
-    except sqlite3.IntegrityError:
+    except INTEGRITY_ERRORS:
         return jsonify(error='That email address or phone number is already used by another account.'),409
     log_activity('admin',None,'customer_updated',f'Customer #{cid}; active={active}; contact/profile updated')
     return jsonify(ok=1,id=cid,name=name,email=email,phone=phone,active=active)
@@ -569,7 +572,7 @@ def release():
 def rate_history(): return jsonify(rows('SELECT * FROM rates WHERE metal=? ORDER BY id DESC LIMIT 80',('silver' if request.args.get('metal')=='silver' else 'gold',)))
 @app.post('/api/admin/sync')
 @auth
-def sync_now(): return jsonify(rates_sync.run_sync(str(DB_PATH),'manual'))
+def sync_now(): return jsonify(rates_sync.run_sync(DB_TARGET,'manual'))
 @app.get('/api/admin/sync-status')
 @auth
 def sync_status():
@@ -693,8 +696,12 @@ def save_product(pid,b):
         except Exception: return jsonify(error='The uploaded image data is invalid.'),400
         if len(raw)>4*1024*1024: return jsonify(error='Image must be 4 MB or smaller.'),400
         ext={'jpeg':'jpg','png':'png','webp':'webp'}[match.group(1)]
-        fname=secrets.token_hex(16)+'.'+ext; folder=PUBLIC/'uploads'; folder.mkdir(parents=True,exist_ok=True)
-        (folder/fname).write_bytes(raw); image_path='uploads/'+fname
+        if USE_POSTGRES:
+            # Persist uploaded product images in the database-backed product record.
+            image_path=f'data:image/{match.group(1)};base64,{match.group(2)}'
+        else:
+            fname=secrets.token_hex(16)+'.'+ext; folder=PUBLIC/'uploads'; folder.mkdir(parents=True,exist_ok=True)
+            (folder/fname).write_bytes(raw); image_path='uploads/'+fname
     active=1 if str(b.get('active',1)).lower() not in ('0','false','no','off') else 0
     ts=now()
     try:
@@ -704,8 +711,8 @@ def save_product(pid,b):
                 db.execute('UPDATE products SET sku=?,name=?,category=?,product_type=?,metal=?,purity=?,weight_g=?,making_per_g=?,stone_charge=?,price_mode=?,fixed_price=?,stock=?,image_path=?,description=?,features=?,active=?,updated=? WHERE id=?',vals+(pid,))
             else:
                 db.execute('INSERT INTO products(sku,name,category,product_type,metal,purity,weight_g,making_per_g,stone_charge,price_mode,fixed_price,stock,image_path,description,features,active,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',vals+(ts,))
-                pid=db.execute('SELECT last_insert_rowid()').fetchone()[0]
-    except sqlite3.IntegrityError: return jsonify(error='That SKU already exists.'),409
+                pid=cur.lastrowid if USE_POSTGRES else db.execute('SELECT last_insert_rowid()').fetchone()[0]
+    except INTEGRITY_ERRORS: return jsonify(error='That SKU already exists.'),409
     log_activity('admin',None,'product_saved',f'Product #{pid} {sku}; active={active}; type={typ}')
     return jsonify(ok=True,id=pid,product=one('SELECT * FROM products WHERE id=?',(pid,)))
 
@@ -746,7 +753,7 @@ def save_bill():
                 cur=db.execute('INSERT INTO bills(no,date,customer,phone,status,total,paid,data,created) VALUES(?,?,?,?,?,?,?,?,?)',(no,ds,b.get('customer',''),b.get('phone',''),st,c['total'],b['paid'],json.dumps(b),now())); bid=cur.lastrowid; b['id']=bid
                 db.execute('UPDATE bills SET data=? WHERE id=?',(json.dumps(b),bid))
         return jsonify(id=bid,no=b['no'],status=st,total=c['total'])
-    except sqlite3.Error as e: return jsonify(error='Could not save bill'),400
+    except DB_ERRORS as e: app.logger.warning('Could not save bill: %s', e); return jsonify(error='Could not save bill'),400
 @app.get('/api/admin/bills')
 @auth
 def list_bills():
@@ -860,6 +867,22 @@ def admin_report():
         order_list.append({'id':o['id'],'customer_id':o['customer_id'],'name':o['name'],'email':o['email'],'phone':o['phone'],'items':items if isinstance(items,list) else [],'total':n(o['total']),'status':o['status'],'created':o['created'],'updated':o['updated'],'address':o['address'],'city':o['city'],'state':o['state'],'pincode':o['pincode'],'delivery_note':o['delivery_note'],'payment_status':o['payment_status'],'payment_method':o['payment_method'],'payment_amount':n(o['payment_amount']),'payment_reference':o['payment_reference'],'bill_id':o['bill_id'],'accepted_for_sales':accepted})
     return jsonify(date=selected,totals={'in_store_sales':round(in_store_sales,2),'online_sales':round(online_sales,2),'total_sales':round(in_store_sales+online_sales,2),'in_store_paid':round(in_store_paid,2),'online_paid':round(online_paid,2),'in_store_grams':round(in_store_grams,3),'online_grams':round(online_grams,3),'total_grams':round(in_store_grams+online_grams,3)},bills=bill_list,orders=order_list)
 
+@app.get('/api/admin/backup')
+@auth
+def admin_backup():
+    """Download a private JSON snapshot of all operational tables."""
+    import io
+    from flask import send_file
+    tables=('kv','admin_accounts','admin_sessions','rates','bills','customers','activity_log','products','orders','product_enquiries','sync_log','rate_audit')
+    snapshot={'created_at':now(),'format':'asian-jewellery-backup-v1','tables':{}}
+    with conn() as db:
+        for table in tables:
+            try: snapshot['tables'][table]=[dict(r) for r in db.execute(f'SELECT * FROM {table}').fetchall()]
+            except Exception:
+                snapshot['tables'][table]=[]
+    payload=json.dumps(snapshot,ensure_ascii=False,indent=2,default=str).encode('utf-8')
+    return send_file(io.BytesIO(payload),mimetype='application/json',as_attachment=True,download_name='asian-jewellery-backup-'+datetime.now().date().isoformat()+'.json')
+
 @app.after_request
 def _nc(r):
     r.headers['Cache-Control']='no-cache'
@@ -870,7 +893,7 @@ def _nc(r):
     r.headers['Content-Security-Policy']="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://images.unsplash.com https:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self' https://wa.me mailto:"
     if APP_ENV=='production': r.headers['Strict-Transport-Security']='max-age=31536000; includeSubDomains'
     return r
-rates_sync.start_scheduler(str(DB_PATH))
+rates_sync.start_scheduler(DB_TARGET)
 
 if __name__=='__main__':
     port=int(os.environ.get('PORT','9000'))

@@ -1,6 +1,7 @@
 """Daily gold/silver rate sync. Sources: AKGSMA site (primary), LiveGold Kerala Kozhikode page (relays AKGSMA board rate).
 Run once from the command line (Windows Task Scheduler): python rates_sync.py"""
 import re, html, json, time, sqlite3, os, logging, urllib.request
+from db_compat import connect as db_connect, USE_POSTGRES, DATABASE_URL
 from datetime import datetime, timezone, timedelta, date
 log=logging.getLogger('rates_sync'); IST=timezone(timedelta(hours=5,minutes=30))
 MON={m:i for i,m in enumerate('January February March April May June July August September October November December'.split(),1)}
@@ -39,13 +40,13 @@ def http_get(u,tries=3):
             if i==tries-1: raise
             time.sleep(2*(i+1))
 def _db(path):
-    c=sqlite3.connect(path,timeout=15); c.row_factory=sqlite3.Row; return c
+    return db_connect(path, timeout=15)
 def migrate(db):
     db.executescript('''CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v TEXT);
     CREATE TABLE IF NOT EXISTS rates(id INTEGER PRIMARY KEY AUTOINCREMENT,metal TEXT,purity TEXT,per_gram REAL,source TEXT,ts TEXT);
     CREATE TABLE IF NOT EXISTS sync_log(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,trigger TEXT,ok INTEGER,source TEXT,message TEXT);
     CREATE TABLE IF NOT EXISTS rate_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT,metal TEXT,purity TEXT,old REAL,new REAL,source TEXT);''')
-    cols=[r[1] for r in db.execute('PRAGMA table_info(rates)')]
+    cols=[r['name'] if isinstance(r,dict) else r[1] for r in db.execute('PRAGMA table_info(rates)')]
     for c in ('kind','rate_date'):
         if c not in cols: db.execute(f'ALTER TABLE rates ADD COLUMN {c} TEXT')
 def cfg(db):
@@ -110,4 +111,4 @@ def start_scheduler(path):
         if not r or (datetime.now(timezone.utc)-datetime.fromisoformat(r['ts'])).total_seconds()>20*3600: run_sync(path,'startup')
     s.add_job(catchup,'date',run_date=datetime.now()+timedelta(seconds=10)); s.start(); return s
 if __name__=='__main__':
-    logging.basicConfig(level=logging.INFO); from app import DB_PATH; print(json.dumps(run_sync(str(DB_PATH),'task-scheduler'),indent=1,ensure_ascii=False))
+    logging.basicConfig(level=logging.INFO); from db_compat import DATABASE_URL, USE_POSTGRES; from app import DB_PATH; target=DATABASE_URL if USE_POSTGRES else str(DB_PATH); print(json.dumps(run_sync(target,'task-scheduler'),indent=1,ensure_ascii=False))
